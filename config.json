@@ -1,0 +1,24 @@
+{
+    "baseUrl": "https://4bsc.ai",
+    "endpoints": {
+        "loginWallet": "/api/front/login/wallet",
+        "authWallet": "/api/front/login/auth_wallet",
+        "createRequest": "/api/front/create/request",
+        "createRepositories": "/api/front/create/repositories",
+        "verifyDailyTask": "/api/front/get/finaltest/verify_daily_task",
+        "farmTask": "/api/front/get/finaltest/farm_task",
+        "farm": "/api/front/get/finaltest/farm",
+        "finishTask": "/api/front/get/finaltest/finish_task",
+        "userInfo": "/api/front/get/user/info",
+        "overallStats": "/api/front/get/finaltest/overall_stats",
+        "leaderboard": "/api/front/get/finaltest/leaderboard_list"
+    },
+    "bscConfig": {
+        "rpcUrl": "https://bsc.meowrpc.com",
+        "chainId": 56,
+        "agentContract": "0xb3ad998af21485562ecd7ea700ef695135cbb491"
+    },
+    "retryAttempts": 5,
+    "retryDelay": 3000,
+    "loopInterval": 86400000
+}
