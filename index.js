@@ -59,8 +59,8 @@ const AGENT_DESCRIPTIONS = [
 ];
 
 const USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 ];
 
 // --- UTILITIES ---
@@ -124,20 +124,24 @@ class FourBSCClient {
 
         this.agentContract = new ethers.Contract(BSC_CONFIG.agentContract, AGENT_ABI, this.wallet);
 
+        // Initialize Axios with Proxy
+        this.initAxios();
+    }
+
+    initAxios() {
         const axiosConfig = {
             baseURL: CONFIG.baseUrl,
-            timeout: 30000,
+            timeout: 60000, // Increased timeout
             headers: this.generateHeaders()
         };
 
-        if (proxyUrl) {
-            const agent = proxyUrl.startsWith('socks') ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
+        if (this.proxyUrl) {
+            const agent = this.proxyUrl.startsWith('socks') ? new SocksProxyAgent(this.proxyUrl) : new HttpsProxyAgent(this.proxyUrl);
             axiosConfig.httpsAgent = agent;
             axiosConfig.httpAgent = agent;
         }
 
         this.axios = axios.create(axiosConfig);
-        this.sessionTid = null;
     }
 
     generateHeaders() {
@@ -148,24 +152,121 @@ class FourBSCClient {
             'Origin': CONFIG.baseUrl,
             'Referer': `${CONFIG.baseUrl}/final-run`,
             'User-Agent': ua,
-            'Connection': 'keep-alive'
+            'Connection': 'keep-alive',
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin'
         };
+    }
+
+    async requestWithRetry(method, url, data = {}, options = {}, retries = 5) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                // Ensure fresh TID for every request
+                const headers = { ...options.headers, tid: generateTid() };
+                const res = await this.axios({ method, url, data, ...options, headers });
+
+                // Check for logic error specifically for Token
+                if (res.data && (res.data.message === 'TOKEN_INVALID' || res.data.message === 'Session expired')) {
+                    log(this.index, `Token Invalid/Expired. Re-logging... (Attempt ${i + 1})`, 'warn');
+                    const loginSuccess = await this.login();
+                    if (loginSuccess) {
+                        // Retry with fresh login token (axios default auth header is updated)
+                        // but we must generate NEW TID again
+                        const newHeaders = { ...options.headers, tid: generateTid() };
+                        return await this.axios({ method, url, data, ...options, headers: newHeaders });
+                    } else {
+                        throw new Error('Re-login failed during retry');
+                    }
+                }
+
+                return res;
+            } catch (error) {
+                const isAuthError = error.response && (error.response.status === 401 || error.response.status === 403);
+                const isNetworkError = !error.response || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message.includes('Proxy connection');
+
+                if (isAuthError) {
+                    log(this.index, `Auth Error (401/403). Re-logging...`, 'warn');
+                    const loginSuccess = await this.login();
+                    if (loginSuccess) {
+                        const newHeaders = { ...options.headers, tid: generateTid() };
+                        return await this.axios({ method, url, data, ...options, headers: newHeaders });
+                    }
+                    throw error;
+                }
+
+                if (i < retries - 1) {
+                    const delay = (i + 1) * 3000;
+                    log(this.index, `Request Error (${url}): ${error.message}. Retrying in ${delay / 1000}s...`, 'warn');
+                    await sleep(delay);
+
+                    // Re-init axios on network errors to refresh proxy connection
+                    if (isNetworkError) this.initAxios();
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+
+    async sendTransactionWithRetry(contractFunc, args, retries = 3) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                // Estimate Gas
+                let gasLimit;
+                try {
+                    gasLimit = await contractFunc.estimateGas(...args);
+                    gasLimit = (gasLimit * 120n) / 100n; // +20% buffer
+                } catch (gasError) {
+                    // Check for hard revert during estimation - usually means invalid logic/state
+                    if (gasError.code === 'CALL_EXCEPTION' || gasError.message.includes('execution reverted')) {
+                        log(this.index, `Gas Estimate Reverted: ${gasError.reason || 'No Reason'} (Check logic/state). Skipping Tx.`, 'error');
+                        return false; // Stop immediately, do not retry
+                    }
+                    log(this.index, `Gas Calc Err: ${gasError.message}. Using Default.`, 'warn');
+                    gasLimit = 500000n; // Fallback
+                }
+
+                // Send Tx
+                const tx = await contractFunc(...args, { gasLimit });
+                log(this.index, `Tx Sent: ${tx.hash}`, 'info');
+                await tx.wait();
+                return true;
+            } catch (error) {
+                // Hard Revert Check
+                if (error.code === 'CALL_EXCEPTION' || error.message.includes('execution reverted')) {
+                    log(this.index, `Tx Reverted: ${error.reason || 'No Reason'}. Skipping.`, 'error');
+                    return false; // Stop immediately
+                }
+
+                if (i < retries - 1) {
+                    log(this.index, `Tx Fail: ${error.message}. Retry ${i + 1}/${retries}`, 'warn');
+                    await sleep(5000);
+                } else {
+                    log(this.index, `Tx Failed after retries: ${error.message}`, 'error');
+                    return false;
+                }
+            }
+        }
+        return false;
     }
 
     async login() {
         try {
             log(this.index, 'Login...', 'info');
-            this.sessionTid = generateTid();
 
-            const nonceRes = await this.axios.post(CONFIG.endpoints.loginWallet, { addr: this.address }, { headers: { tid: this.sessionTid } });
+            const nonceRes = await this.requestWithRetry('post', CONFIG.endpoints.loginWallet, { addr: this.address });
             if (nonceRes.data.code !== 0) throw new Error(nonceRes.data.message);
 
             const nonce = nonceRes.data.data.nonce;
             const signature = await this.wallet.signMessage(nonce);
 
-            const authRes = await this.axios.post(CONFIG.endpoints.authWallet, {
+            const authRes = await this.requestWithRetry('post', CONFIG.endpoints.authWallet, {
                 addr: this.address, signature, nonce
-            }, { headers: { tid: this.sessionTid } });
+            });
 
             if (authRes.data.code !== 0) throw new Error(authRes.data.message);
 
@@ -187,59 +288,88 @@ class FourBSCClient {
 
         try {
             // Verify Tasks
-            const taskRes = await this.axios.post(CONFIG.endpoints.verifyDailyTask, {}, { headers: { tid: this.sessionTid } });
+            // HAR shows content-length: 0, so we send undefined/null data to ensure empty body
+            const taskRes = await this.requestWithRetry('post', CONFIG.endpoints.verifyDailyTask);
             const taskData = taskRes.data.data;
+
+            // Explicit Status Check Logging
+            const isRequestDone = taskData?.is_create_request;
+            const isAgentDone = taskData?.is_create_agent;
+
+            log(this.index, `Server Status -> Request: ${isRequestDone ? 'DONE ✅' : 'NOT DONE ❌'} | Agent: ${isAgentDone ? 'DONE ✅' : 'NOT DONE ❌'}`, 'info');
 
             let status = 'Tasks Done';
             let performed = 0;
 
             // 1. Create Request
-            if (!taskData?.is_create_request) {
-                log(this.index, 'Creating Request...', 'info');
+            if (!isRequestDone) {
+                log(this.index, 'Action: Starting Request Task...', 'info');
                 const title = getRandomItem(TITLES);
-                const reqRes = await this.axios.post(CONFIG.endpoints.createRequest, {
+                const reqRes = await this.requestWithRetry('post', CONFIG.endpoints.createRequest, {
                     title, content: getRandomContent(), is_mobile: false
-                }, { headers: { tid: this.sessionTid } });
+                });
 
-                if (reqRes.data.code === 0) {
-                    await sleep(5000);
+                if (reqRes.data.code === 0 && reqRes.data.data?.id) {
+                    await sleep(2000);
                     // On-Chain
-                    const tx = await this.wallet.sendTransaction({
-                        to: BSC_CONFIG.agentContract,
-                        data: this.agentContract.interface.encodeFunctionData('submitRequest', [reqRes.data.data.id, title])
-                    });
-                    await tx.wait();
-                    log(this.index, 'Request Completed ✅', 'success');
-                    performed++;
+                    const wrappedContract = this.agentContract.connect(this.wallet);
+                    const success = await this.sendTransactionWithRetry(
+                        wrappedContract.submitRequest,
+                        [reqRes.data.data.id, title]
+                    );
+
+                    if (success) {
+                        log(this.index, 'Request Completed ✅', 'success');
+                        performed++;
+                    } else {
+                        log(this.index, 'Request Tx Failed ❌ (Skipping to next task)', 'warn');
+                    }
+                } else {
+                    log(this.index, `Create Request API Failed: ${reqRes.data.message}`, 'error');
                 }
+            } else {
+                log(this.index, 'Skipping Request Task (Already Done)', 'info');
             }
 
             // 2. Create Agent
-            if (!taskData?.is_create_agent) {
-                log(this.index, 'Creating Agent...', 'info');
+            if (!isAgentDone) {
+                log(this.index, 'Action: Starting Agent Task...', 'info');
                 const name = getRandomAgentName();
-                const agentRes = await this.axios.post(CONFIG.endpoints.createRepositories, {
+                const agentRes = await this.requestWithRetry('post', CONFIG.endpoints.createRepositories, {
                     name, tag: [0], description: getRandomItem(AGENT_DESCRIPTIONS)
-                }, { headers: { tid: this.sessionTid } });
+                });
 
-                if (agentRes.data.code === 0) {
-                    await sleep(5000);
+                if (agentRes.data.code === 0 && agentRes.data.data?.id) {
+                    await sleep(2000);
                     // On-Chain
-                    const tx = await this.wallet.sendTransaction({
-                        to: BSC_CONFIG.agentContract,
-                        data: this.agentContract.interface.encodeFunctionData('submitAgent', [agentRes.data.data.id, name, getRandomItem(AGENT_DESCRIPTIONS)])
-                    });
-                    await tx.wait();
-                    log(this.index, 'Agent Completed ✅', 'success');
-                    performed++;
+                    const wrappedContract = this.agentContract.connect(this.wallet);
+                    const success = await this.sendTransactionWithRetry(
+                        wrappedContract.submitAgent,
+                        [agentRes.data.data.id, name, getRandomItem(AGENT_DESCRIPTIONS)]
+                    );
+
+                    if (success) {
+                        log(this.index, 'Agent Completed ✅', 'success');
+                        performed++;
+                    } else {
+                        log(this.index, 'Agent Tx Failed ❌ (Skipping)', 'warn');
+                    }
+                } else {
+                    log(this.index, `Create Agent API Failed: ${agentRes.data.message}`, 'error');
                 }
+            } else {
+                log(this.index, 'Skipping Agent Task (Already Done)', 'info');
             }
 
             // Get updated points
-            const userRes = await this.axios.post(CONFIG.endpoints.userInfo, {}, { headers: { tid: this.sessionTid } });
-            const points = userRes.data.data?.credit || 0;
-
-            return { success: true, points, status: performed > 0 ? 'Work Done' : 'Already Done' };
+            try {
+                // HAR shows empty body for stats calls too
+                const userRes = await this.requestWithRetry('post', CONFIG.endpoints.userInfo);
+                const points = userRes.data.data?.credit || 0;
+                return { success: true, points, status: performed > 0 ? 'Work Done' : 'Already Done' };
+            } catch (err) {
+                return { success: true, points: '?', status: performed > 0 ? 'Work Done' : 'Already Done' };
+            }
 
         } catch (e) {
             log(this.index, `Task details: ${e.message}`, 'error');

@@ -8,3 +8,5 @@ session/
 pk.txt
 proxy.txt
 wallet_db.json
+ref readme.md
+index.js
