@@ -470,11 +470,15 @@ class FourBSCClient {
                 log(this.index, 'Skipping Agent Task (Already Done)', 'info');
             }
 
-            // Get updated points
+            // Get updated points from verify response
             try {
-                // HAR shows empty body for stats calls too
-                const userRes = await this.requestWithRetry('post', CONFIG.endpoints.userInfo);
-                const points = userRes.data.data?.credit || 0;
+                // Extract points from taskData.message (e.g., "You've earned 150 pts.")
+                let points = '-';
+                if (taskData?.message) {
+                    const match = taskData.message.match(/(\d+)\s*pts/i);
+                    if (match) points = match[1];
+                }
+                log(this.index, `Points Status: ${taskData?.message || 'N/A'}`, 'info');
                 return { success: true, points, status: performed > 0 ? 'Work Done' : 'Already Done' };
             } catch (err) {
                 return { success: true, points: '?', status: performed > 0 ? 'Work Done' : 'Already Done' };
