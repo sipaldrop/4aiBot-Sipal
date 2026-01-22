@@ -31,10 +31,40 @@ try {
 const BSC_CONFIG = CONFIG.bscConfig;
 
 // --- RESOURCES & CONSTANTS ---
+// IMPORTANT: These are the CORRECT function selectors discovered from successful on-chain transactions.
+// The contract is unverified so we use Interface with corrected selectors.
+// Selector 0x9897934c = Agent submission (uint256, string, string)
+// Selector 0xc9a5fadf = Request submission (uint256, string)
 const AGENT_ABI = [
-    'function submitAgent(uint256 agentId, string name, string description) external',
-    'function submitRequest(uint256 requestId, string title) external'
+    // Use explicit function fragments that match the actual contract
+    {
+        "type": "function",
+        "name": "submitAgentData",  // Placeholder name - selector is what matters
+        "inputs": [
+            { "name": "agentId", "type": "uint256" },
+            { "name": "name", "type": "string" },
+            { "name": "description", "type": "string" }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+    },
+    {
+        "type": "function",
+        "name": "submitRequestData",  // Placeholder name - selector is what matters
+        "inputs": [
+            { "name": "requestId", "type": "uint256" },
+            { "name": "title", "type": "string" }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+    }
 ];
+
+// Correct function selectors from on-chain analysis
+const FUNCTION_SELECTORS = {
+    SUBMIT_AGENT: '0x9897934c',      // (uint256, string, string)
+    SUBMIT_REQUEST: '0xc9a5fadf'     // (uint256, string)
+};
 
 const TITLES = [
     "exploring the future of decentralized", "blockchain technology is fascinating", "excited about web3 possibilities",
@@ -67,6 +97,14 @@ const USER_AGENTS = [
 function getRandomItem(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 async function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function generateTid() { return `${Date.now()}-${uuidv4()}`; }
+
+async function runWithTimeout(promise, ms, errorMsg) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(errorMsg)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // Enhanced Logging per Sipal Standard
 function log(accountIndex, message, type = 'info') {
@@ -254,6 +292,74 @@ class FourBSCClient {
         return false;
     }
 
+    // NEW: Send raw transaction with correct function selectors
+    async sendRawTransaction(selector, paramTypes, paramValues, retries = 3) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                // Encode parameters without selector
+                const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+                const encodedParams = abiCoder.encode(paramTypes, paramValues);
+
+                // Combine selector + encoded params
+                const calldata = selector + encodedParams.slice(2); // Remove 0x from params
+
+                // Prepare transaction
+                const txRequest = {
+                    to: BSC_CONFIG.agentContract,
+                    data: calldata,
+                };
+
+                // Estimate gas
+                let gasLimit;
+                try {
+                    // Added timeout for gas estimation (10s)
+                    gasLimit = await runWithTimeout(this.wallet.estimateGas(txRequest), 10000, 'Gas Estimate Timeout');
+                    gasLimit = (gasLimit * 120n) / 100n; // +20% buffer
+                } catch (gasError) {
+                    if (gasError.message === 'Gas Estimate Timeout') {
+                        log(this.index, `Gas Estimate Timed Out. Using Default 300k.`, 'warn');
+                        gasLimit = 300000n;
+                    } else if (gasError.code === 'CALL_EXCEPTION' || gasError.message.includes('execution reverted')) {
+                        log(this.index, `Gas Estimate Reverted: ${gasError.reason || gasError.message?.slice(0, 50) || 'Unknown'} - Check if task already done on-chain`, 'error');
+                        return false;
+                    } else {
+                        log(this.index, `Gas Calc Err: ${gasError.message}. Using Default 200k.`, 'warn');
+                        gasLimit = 200000n;
+                    }
+                }
+
+                // Send transaction with timeout (30s)
+                const tx = await runWithTimeout(this.wallet.sendTransaction({ ...txRequest, gasLimit }), 30000, 'Tx Send Timeout');
+
+                log(this.index, `Tx Sent: ${tx.hash}`, 'info');
+
+                // Wait for receipt with timeout (60s)
+                const receipt = await runWithTimeout(tx.wait(), 60000, 'Tx Wait Timeout');
+
+                if (receipt.status === 1) {
+                    return true;
+                } else {
+                    log(this.index, `Tx Mined but Failed. Check BSCScan.`, 'error');
+                    return false;
+                }
+            } catch (error) {
+                if (error.code === 'CALL_EXCEPTION' || error.message.includes('execution reverted')) {
+                    log(this.index, `Tx Reverted: ${error.reason || 'No Reason'}. Skipping.`, 'error');
+                    return false;
+                }
+
+                if (i < retries - 1) {
+                    log(this.index, `Tx Fail: ${error.message}. Retry ${i + 1}/${retries}`, 'warn');
+                    await sleep(5000);
+                } else {
+                    log(this.index, `Tx Failed after retries: ${error.message}`, 'error');
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
     async login() {
         try {
             log(this.index, 'Login...', 'info');
@@ -311,10 +417,11 @@ class FourBSCClient {
 
                 if (reqRes.data.code === 0 && reqRes.data.data?.id) {
                     await sleep(2000);
-                    // On-Chain
-                    const wrappedContract = this.agentContract.connect(this.wallet);
-                    const success = await this.sendTransactionWithRetry(
-                        wrappedContract.submitRequest,
+                    // On-Chain with CORRECT selector 0xc9a5fadf
+                    log(this.index, `Submitting Request ID ${reqRes.data.data.id} on-chain...`, 'info');
+                    const success = await this.sendRawTransaction(
+                        FUNCTION_SELECTORS.SUBMIT_REQUEST,
+                        ['uint256', 'string'],
                         [reqRes.data.data.id, title]
                     );
 
@@ -341,11 +448,13 @@ class FourBSCClient {
 
                 if (agentRes.data.code === 0 && agentRes.data.data?.id) {
                     await sleep(2000);
-                    // On-Chain
-                    const wrappedContract = this.agentContract.connect(this.wallet);
-                    const success = await this.sendTransactionWithRetry(
-                        wrappedContract.submitAgent,
-                        [agentRes.data.data.id, name, getRandomItem(AGENT_DESCRIPTIONS)]
+                    // On-Chain with CORRECT selector 0x9897934c
+                    const agentDescription = getRandomItem(AGENT_DESCRIPTIONS);
+                    log(this.index, `Submitting Agent ID ${agentRes.data.data.id} on-chain...`, 'info');
+                    const success = await this.sendRawTransaction(
+                        FUNCTION_SELECTORS.SUBMIT_AGENT,
+                        ['uint256', 'string', 'string'],
+                        [agentRes.data.data.id, name, agentDescription]
                     );
 
                     if (success) {
